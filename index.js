@@ -192,6 +192,75 @@ app.delete("/services/:id", async (req, res) => {
   }
 });
 
+// Update an existing salon service by ID
+app.patch("/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate MongoDB ObjectId format
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID format.",
+      });
+    }
+
+    // Prevent overwriting _id or createdAt accidentally
+    const { _id, createdAt, ...updateFields } = req.body;
+
+    const cleanUpdate = {
+      ...updateFields,
+      updatedAt: new Date(),
+    };
+
+    if (typeof cleanUpdate.serviceName === "string") {
+      cleanUpdate.serviceName = cleanUpdate.serviceName.trim();
+      if (!cleanUpdate.serviceName) {
+        return res.status(400).json({
+          success: false,
+          message: "Service name cannot be empty.",
+        });
+      }
+    }
+
+    if (cleanUpdate.price !== undefined) {
+      cleanUpdate.price = Number(cleanUpdate.price) || 0;
+    }
+
+    if (typeof cleanUpdate.createdBy === "string") {
+      cleanUpdate.createdBy = cleanUpdate.createdBy.trim().toLowerCase();
+    }
+
+    const result = await servicesCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: cleanUpdate }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found.",
+      });
+    }
+
+    const updatedService = await servicesCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Service updated successfully.",
+      data: updatedService,
+    });
+  } catch (error) {
+    console.error("Error updating service:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update service.",
+    });
+  }
+});
+
 
 
 
