@@ -2,6 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import 'dotenv/config'
 import { MongoClient } from 'mongodb';
+import { ObjectId } from "mongodb";
+
 
 
 const app = express();
@@ -120,8 +122,6 @@ app.get('/services', async (req, res) => {
   }
 });
 
-import { ObjectId } from "mongodb";
-
 // Fetch a single salon service by ID (details)
 app.get("/services/:id", async (req, res) => {
   try {
@@ -152,6 +152,42 @@ app.get("/services/:id", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch service details.",
+    });
+  }
+});
+
+// Delete a salon service by ID
+app.delete("/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate MongoDB ObjectId format
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID format.",
+      });
+    }
+
+    const result = await servicesCollection.deleteOne({ _id: new ObjectId(id) });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Service deleted successfully.",
+      deletedId: id,
+    });
+  } catch (error) {
+    console.error("Error deleting service:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete service.",
     });
   }
 });
