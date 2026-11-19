@@ -28,14 +28,16 @@ const servicesCollection = db.collection("services");
 
 // services related api 
 
-// 1. Create a new service (POST API)
-// Create a new salon service using  creator email
+// Create a new service using  creator email
 app.post("/services", async (req, res) => {
   try {
     const serviceData = req.body;
+    const serviceName = String(
+      serviceData.serviceName || serviceData.name || ""
+    ).trim();
 
     // Ensure required fields and creator email are present
-    if (!serviceData.name || !serviceData.category || !serviceData.createdBy) {
+    if (!serviceName || !serviceData.category || !serviceData.createdBy) {
       return res.status(400).json({
         success: false,
         message: "Service name, category, and createdBy email are required.",
@@ -44,13 +46,17 @@ app.post("/services", async (req, res) => {
 
     const newService = {
       ...serviceData,
+      serviceName,
       price: Number(serviceData.price) || 0,
+      isActive:
+        typeof serviceData.isActive === "boolean"
+          ? serviceData.isActive
+          : serviceData.status !== "inactive",
       createdBy: String(serviceData.createdBy).trim().toLowerCase(),
       createdAt: new Date(),
     };
 
     const result = await servicesCollection.insertOne(newService);
-
     return res.status(201).json({
       success: true,
       message: "Service created successfully.",
@@ -68,12 +74,9 @@ app.post("/services", async (req, res) => {
   }
 });
 
-
-
 // Get all active services API
 app.get('/services', async (req, res) => {
   try {
-
     // Get query parameters from the client
     const { category, search, limit } = req.query;
     let query = { isActive: true };
@@ -84,9 +87,9 @@ app.get('/services', async (req, res) => {
       query.category = category;
     }
 
-    // Search services by name if a search value is provided
+    // Search services by serviceName if a search value is provided
     if (search) {
-      query.name = {
+      query.serviceName = {
         $regex: search,
         $options: 'i'
       };
@@ -106,16 +109,50 @@ app.get('/services', async (req, res) => {
     const services = await cursor.toArray();
     res.status(200).json({
       success: true,
-      count: services.length, // Total number of services found
-      data: services,         
+      count: services.length,
+      data: services,
     });
-
   } catch (error) {
     res.status(500).json({
       success: false,
       message: error.message
     });
+  }
+});
 
+import { ObjectId } from "mongodb";
+
+// Fetch a single salon service by ID (details)
+app.get("/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Validate MongoDB ObjectId format before querying
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid service ID format.",
+      });
+    }
+
+    const service = await servicesCollection.findOne({ _id: new ObjectId(id) });
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: service,
+    });
+  } catch (error) {
+    console.error("Error fetching service by ID:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch service details.",
+    });
   }
 });
 
