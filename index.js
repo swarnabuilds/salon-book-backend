@@ -69,37 +69,56 @@ app.post("/services", async (req, res) => {
 });
 
 
-// 2. Get all services / active services (GET API)
-// app.get('/services', async (req, res) => {
-//   try {
-//     const { category, search, limit } = req.query;
-//     let query = { isActive: true }; // রিকোয়ারমেন্ট অনুযায়ী শুধু অ্যাক্টিভ সার্ভিসগুলো দেখাবে
 
-//     if (category && category !== 'All') {
-//       query.category = category;
-//     }
+// Get all active services API
+app.get('/services', async (req, res) => {
+  try {
 
-//     if (search) {
-//       query.name = { $regex: search, $options: 'i' };
-//     }
+    // Get query parameters from the client
+    const { category, search, limit } = req.query;
+    let query = { isActive: true };
 
-//     let cursor = servicesCollection.find(query).sort({ createdAt: -1 });
+    // Filter services by category if a category is provided
+    // Skip category filtering when the category is "All"
+    if (category && category !== 'All') {
+      query.category = category;
+    }
 
-//     if (limit) {
-//       cursor = cursor.limit(Number(limit));
-//     }
+    // Search services by name if a search value is provided
+    if (search) {
+      query.name = {
+        $regex: search,
+        $options: 'i'
+      };
+    }
 
-//     const services = await cursor.toArray();
+    // Find services based on the query
+    // Newest services will appear first
+    let cursor = servicesCollection
+      .find(query)
+      .sort({ createdAt: -1 });
 
-//     res.status(200).json({
-//       success: true,
-//       count: services.length,
-//       data: services,
-//     });
-//   } catch (error) {
-//     res.status(500).json({ success: false, message: error.message });
-//   }
-// });
+    // Limit the number of returned services if a limit is provided
+    if (limit) {
+      cursor = cursor.limit(Number(limit));
+    }
+
+    const services = await cursor.toArray();
+    res.status(200).json({
+      success: true,
+      count: services.length, // Total number of services found
+      data: services,         
+    });
+
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message
+    });
+
+  }
+});
+
 
 
 
