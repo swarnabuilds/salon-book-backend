@@ -5,7 +5,6 @@ import { MongoClient } from 'mongodb';
 import { ObjectId } from "mongodb";
 
 
-
 const app = express();
 const port = process.env.PORT ||  5000;
 
@@ -14,7 +13,6 @@ app.use(express.json())
 
 
 const client = new MongoClient(process.env.MONGO_URI)
-
 export async function connectToMongoDB() {
   try {
     await client.connect();
@@ -27,9 +25,10 @@ export async function connectToMongoDB() {
 const connectedClient = await connectToMongoDB();
 const db = connectedClient.db("salon-book-system");
 const servicesCollection = db.collection("services");
+const appointmentsCollection = db.collection("appointments");
+
 
 // services related api 
-
 // Create a new service using  creator email
 app.post("/services", async (req, res) => {
   try {
@@ -257,6 +256,109 @@ app.patch("/services/:id", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to update service.",
+    });
+  }
+});
+
+
+// appointments api
+// Create a new appointment booking
+// Create a new appointment booking (without authMiddleware for now)
+
+app.post("/appointments", async (req, res) => {
+  try {
+    const {
+      serviceId,
+      appointmentDate,
+      timeSlot,
+      message,
+      customerId,
+      customerName,
+      customerEmail,
+      customerRole,
+    } = req.body;
+
+    // Validate required fields
+    if (!serviceId || !customerEmail || !appointmentDate || !timeSlot) {
+      return res.status(400).json({
+        success: false,
+        message: "Required fields are missing.",
+      });
+    }
+
+    // Allow only customers to book appointments
+    const normalizedRole = String(customerRole || "customer").trim().toLowerCase();
+    if (normalizedRole !== "customer") {
+      return res.status(403).json({
+        success: false,
+        message: "Only customers can book appointments.",
+      });
+    }
+
+    // Find the requested service
+    const service = ObjectId.isValid(serviceId)
+      ? await servicesCollection.findOne({ _id: new ObjectId(serviceId) })
+      : null;
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found.",
+      });
+    }
+
+    // Check active status supporting both isActive and status fields
+    const isActive = service.isActive !== false && service.status !== "inactive";
+    if (!isActive) {
+      return res.status(400).json({
+        success: false,
+        message: "This service is currently inactive.",
+      });
+    }
+
+    // Check for an existing booking in the same time slot
+    const existingBooking = await appointmentsCollection.findOne({
+      serviceId,
+      appointmentDate: String(appointmentDate).trim(),
+      timeSlot: String(timeSlot).trim(),
+      status: { $in: ["pending", "confirmed"] },
+    });
+
+    if (existingBooking) {
+      return res.status(409).json({
+        success: false,
+        message: "This time slot is already booked.",
+      });
+    }
+
+    // Create the appointment
+    const appointment = {
+      serviceId,
+      customerId: customerId || "",
+      customerName: String(customerName || "").trim(),
+      customerEmail: String(customerEmail).trim().toLowerCase(),
+      serviceName: service.serviceName,
+      appointmentDate: String(appointmentDate).trim(),
+      timeSlot: String(timeSlot).trim(),
+      message: String(message || "").trim(),
+      servicePrice: service.price,
+      status: "pending",
+      paymentStatus: "unpaid",
+      createdAt: new Date(),
+    };
+
+    const result = await appointmentsCollection.insertOne(appointment);
+
+    return res.status(201).json({
+      success: true,
+      message: "Appointment booked successfully.",
+      data: { _id: result.insertedId, ...appointment },
+    });
+  } catch (error) {
+    console.error("Appointment booking error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error.",
     });
   }
 });
