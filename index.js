@@ -422,11 +422,12 @@ app.get("/appointments", async (req, res) => {
   }
 });
 
-//cencle appointment
+// Update appointment status (confirmed, completed, cancelled)
 app.patch("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
+    const nextStatus = String(status || "").trim().toLowerCase();
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -435,7 +436,14 @@ app.patch("/appointments/:id", async (req, res) => {
       });
     }
 
-    const appointmentsCollection = db.collection("appointments");
+    const allowedStatuses = ["confirmed", "completed", "cancelled"];
+    if (!allowedStatuses.includes(nextStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: "Unsupported update operation.",
+      });
+    }
+
     const existing = await appointmentsCollection.findOne({
       _id: new ObjectId(id),
     });
@@ -447,35 +455,35 @@ app.patch("/appointments/:id", async (req, res) => {
       });
     }
 
-    if (status === "cancelled") {
-      const currentStatus = String(existing.status || "pending").toLowerCase();
+    const currentStatus = String(existing.status || "pending").toLowerCase();
 
-      if (currentStatus !== "pending") {
-        return res.status(400).json({
-          success: false,
-          message: `Cannot cancel an already ${currentStatus} appointment.`,
-        });
-      }
-
-      await appointmentsCollection.updateOne(
-        { _id: new ObjectId(id) },
-        {
-          $set: {
-            status: "cancelled",
-            updatedAt: new Date(),
-          },
-        }
-      );
-
-      return res.status(200).json({
-        success: true,
-        message: "Appointment cancelled successfully.",
+    if (nextStatus === "cancelled" && currentStatus !== "pending") {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot cancel an already ${currentStatus} appointment.`,
       });
     }
 
-    return res.status(400).json({
-      success: false,
-      message: "Unsupported update operation.",
+    if (nextStatus === "confirmed" && currentStatus === "cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot confirm a cancelled appointment.",
+      });
+    }
+
+    await appointmentsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status: nextStatus,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: `Appointment ${nextStatus} successfully.`,
     });
   } catch (error) {
     console.error("PATCH /appointments/:id error:", error);
@@ -485,7 +493,6 @@ app.patch("/appointments/:id", async (req, res) => {
     });
   }
 });
-
 
 
 app.get('/', (req, res) => {
