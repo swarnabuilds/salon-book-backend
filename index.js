@@ -422,6 +422,69 @@ app.get("/appointments", async (req, res) => {
   }
 });
 
+//cencle appointment
+app.patch("/appointments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid appointment ID.",
+      });
+    }
+
+    const appointmentsCollection = db.collection("appointments");
+    const existing = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Appointment not found.",
+      });
+    }
+
+    if (status === "cancelled") {
+      const currentStatus = String(existing.status || "pending").toLowerCase();
+
+      if (currentStatus !== "pending") {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot cancel an already ${currentStatus} appointment.`,
+        });
+      }
+
+      await appointmentsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status: "cancelled",
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: "Appointment cancelled successfully.",
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      message: "Unsupported update operation.",
+    });
+  } catch (error) {
+    console.error("PATCH /appointments/:id error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while updating appointment.",
+    });
+  }
+});
 
 
 
