@@ -364,6 +364,65 @@ app.post("/appointments", async (req, res) => {
 });
 
 
+// Get appointments (filtered by customerEmail)
+app.get("/appointments", async (req, res) => {
+  try {
+    const { email, status } = req.query;
+    const query = {};
+
+    if (email) {
+      query.customerEmail = String(email).trim().toLowerCase();
+    }
+    if (status && status !== "all") {
+      query.status = String(status).trim().toLowerCase();
+    }
+
+    const appointments = await appointmentsCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const enrichedAppointments = await Promise.all(
+      appointments.map(async (item) => {
+        let serviceImage = item.serviceImage || item.image || "";
+        let serviceCategory = item.serviceCategory || item.category || "";
+
+        if (
+          (!serviceImage || !serviceCategory) &&
+          item.serviceId &&
+          ObjectId.isValid(item.serviceId)
+        ) {
+          const srv = await servicesCollection.findOne({
+            _id: new ObjectId(item.serviceId),
+          });
+          if (srv) {
+            serviceImage = serviceImage || srv.image || "";
+            serviceCategory = serviceCategory || srv.category || "";
+          }
+        }
+
+        return {
+          ...item,
+          serviceImage,
+          serviceCategory,
+        };
+      })
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: enrichedAppointments,
+    });
+  } catch (error) {
+    console.error("Fetch appointments error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch appointments.",
+    });
+  }
+});
+
+
 
 
 app.get('/', (req, res) => {
