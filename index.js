@@ -423,24 +423,16 @@ app.get("/appointments", async (req, res) => {
 });
 
 // Update appointment status (confirmed, completed, cancelled)
+// Update appointment status or payment status
 app.patch("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
-    const nextStatus = String(status || "").trim().toLowerCase();
+    const { status, paymentStatus, stripeSessionId } = req.body;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
         success: false,
         message: "Invalid appointment ID.",
-      });
-    }
-
-    const allowedStatuses = ["confirmed", "completed", "cancelled"];
-    if (!allowedStatuses.includes(nextStatus)) {
-      return res.status(400).json({
-        success: false,
-        message: "Unsupported update operation.",
       });
     }
 
@@ -452,6 +444,45 @@ app.patch("/appointments/:id", async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "Appointment not found.",
+      });
+    }
+
+    // Update payment status after Stripe payment completes
+    if (paymentStatus) {
+      const normalizedPayment = String(paymentStatus).trim().toLowerCase();
+      if (!["paid", "unpaid"].includes(normalizedPayment)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid payment status.",
+        });
+      }
+
+      await appointmentsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            paymentStatus: normalizedPayment,
+            ...(stripeSessionId ? { stripeSessionId } : {}),
+            paidAt: new Date(),
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: `Payment marked as ${normalizedPayment}.`,
+      });
+    }
+
+    // Update booking status (confirmed, completed, cancelled)
+    const nextStatus = String(status || "").trim().toLowerCase();
+    const allowedStatuses = ["confirmed", "completed", "cancelled"];
+
+    if (!allowedStatuses.includes(nextStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: "Unsupported update operation.",
       });
     }
 
