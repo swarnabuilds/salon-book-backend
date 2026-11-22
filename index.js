@@ -102,26 +102,36 @@ const AUTH_URL = (
   "http://localhost:3000"
 ).replace(/\/$/, "");
 
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeRole(value) {
+  return String(value || "customer").trim().toLowerCase();
+}
+
 async function getAuthenticatedUser(req) {
-  // A verified JWT is preferred when the client sends one. Re-read the user
-  // from MongoDB so a newly blocked account loses access immediately.
+  // A verified JWT is preferred, but the database remains the source of truth.
+  // Token claims alone are never trusted for identity, role, or blocked state.
   if (req.jwtUser) {
-    const freshUser = await usersCollection.findOne({
-      $or: [
-        buildUserIdFilter(req.jwtUser.id),
-        { email: req.jwtUser.email },
-      ],
-    });
+    const email = normalizeEmail(req.jwtUser.email);
+    const identityQuery = [];
 
-    if (freshUser) {
-      return {
-        ...req.jwtUser,
-        role: freshUser.role || req.jwtUser.role,
-        isBlocked: Boolean(freshUser.isBlocked),
-      };
-    }
+    if (req.jwtUser.id) identityQuery.push(buildUserIdFilter(req.jwtUser.id));
+    if (email) identityQuery.push({ email });
+    if (!identityQuery.length) return null;
 
-    return req.jwtUser;
+    const freshUser = await usersCollection.findOne({ $or: identityQuery });
+    if (!freshUser) return null;
+
+    return {
+      id: String(freshUser._id),
+      _id: freshUser._id,
+      name: freshUser.name || "",
+      email: normalizeEmail(freshUser.email),
+      role: normalizeRole(freshUser.role || req.jwtUser.role),
+      isBlocked: Boolean(freshUser.isBlocked),
+    };
   }
 
   const cookie = req.headers.cookie;
@@ -134,7 +144,28 @@ async function getAuthenticatedUser(req) {
   if (!response.ok) return null;
 
   const data = await response.json().catch(() => null);
-  return data?.user || null;
+  const sessionUser = data?.user || null;
+  if (!sessionUser) return null;
+
+  // Apply the same database freshness check to cookie-based sessions.
+  const email = normalizeEmail(sessionUser.email);
+  const identityQuery = [];
+
+  if (sessionUser.id) identityQuery.push(buildUserIdFilter(sessionUser.id));
+  if (email) identityQuery.push({ email });
+  if (!identityQuery.length) return null;
+
+  const freshUser = await usersCollection.findOne({ $or: identityQuery });
+  if (!freshUser) return null;
+
+  return {
+    id: String(freshUser._id),
+    _id: freshUser._id,
+    name: freshUser.name || "",
+    email: normalizeEmail(freshUser.email),
+    role: normalizeRole(freshUser.role || sessionUser.role),
+    isBlocked: Boolean(freshUser.isBlocked),
+  };
 }
 
 // Use this on every admin-only API route.
@@ -149,9 +180,7 @@ async function requireAdmin(req, res, next) {
       });
     }
 
-    const role = String(user.role || "customer").trim().toLowerCase();
-
-    if (role !== "admin") {
+    if (normalizeRole(user.role) !== "admin") {
       return res.status(403).json({
         success: false,
         message: "Admin access required.",
@@ -165,6 +194,7 @@ async function requireAdmin(req, res, next) {
       });
     }
 
+    req.authenticatedUser = user;
     return next();
   } catch (error) {
     console.error("Admin session verification failed:", error);
@@ -183,6 +213,65 @@ function buildUserIdFilter(id) {
   }
 
   return { _id: { $in: values } };
+}
+
+// Appointments store customerId as a string, but older records may use an
+// ObjectId or an email. Match all safe forms without trusting client input.
+function buildCustomerIdFilter(id) {
+  const values = [String(id)];
+
+  if (ObjectId.isValid(id)) {
+    values.unshift(new ObjectId(id));
+  }
+
+  return { $in: values };
+}
+
+// Build the query used for every customer-owned collection. Email is kept as
+// a fallback for older records, but the stored customerId is checked first.
+function buildCustomerOwnershipFilter(user) {
+  const clauses = [];
+  const id = String(user?.id || user?._id || "").trim();
+  const email = normalizeEmail(user?.email);
+
+  if (id) {
+    clauses.push({ customerId: buildCustomerIdFilter(id) });
+  }
+
+  if (email) {
+    clauses.push({ customerEmail: email });
+    clauses.push({ customerId: email });
+  }
+
+  return { $or: clauses.length ? clauses : [{ _id: "__no_user__" }] };
+}
+
+function isAppointmentOwner(user, appointment) {
+  const userId = String(user?.id || user?._id || "")
+    .trim()
+    .toLowerCase();
+  const customerId = String(appointment?.customerId || "")
+    .trim()
+    .toLowerCase();
+  const email = normalizeEmail(user?.email);
+
+  if (userId && customerId && userId === customerId) return true;
+  if (email && normalizeEmail(appointment?.customerEmail) === email) return true;
+  if (email && customerId === email) return true;
+
+  return false;
+}
+
+function matchesInternalSecret(provided, expected) {
+  if (!provided || !expected) return false;
+
+  const providedBuffer = Buffer.from(String(provided));
+  const expectedBuffer = Buffer.from(String(expected));
+
+  return (
+    providedBuffer.length === expectedBuffer.length &&
+    timingSafeEqual(providedBuffer, expectedBuffer)
+  );
 }
 
 function escapeRegex(value) {
@@ -220,11 +309,20 @@ app.post("/services", requireAdmin, async (req, res) => {
       serviceData.serviceName || serviceData.name || ""
     ).trim();
 
-    // Ensure required fields and creator email are present
-    if (!serviceName || !serviceData.category || !serviceData.createdBy) {
+    if (!serviceName || !serviceData.category) {
       return res.status(400).json({
         success: false,
-        message: "Service name, category, and createdBy email are required.",
+        message: "Service name and category are required.",
+      });
+    }
+
+    // The creator is derived from the verified admin session, never from the
+    // request body. This prevents one admin from attributing records to another.
+    const adminEmail = normalizeEmail(req.authenticatedUser?.email);
+    if (!adminEmail) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to continue.",
       });
     }
 
@@ -251,14 +349,22 @@ app.post("/services", requireAdmin, async (req, res) => {
         ? serviceData.isActive
         : serviceData.status !== "inactive";
 
+    const {
+      createdBy,
+      createdByEmail,
+      creatorEmail,
+      _id,
+      ...safeServiceData
+    } = serviceData;
+
     const newService = {
-      ...serviceData,
+      ...safeServiceData,
       serviceName,
       price: priceValue,
       duration: durationValue,
       isActive,
       status: isActive ? "active" : "inactive",
-      createdBy: String(serviceData.createdBy).trim().toLowerCase(),
+      createdBy: adminEmail,
       createdAt: new Date(),
     };
 
@@ -464,8 +570,15 @@ app.patch("/services/:id", requireAdmin, async (req, res) => {
       });
     }
 
-    // Prevent overwriting _id or createdAt accidentally
-    const { _id, createdAt, ...updateFields } = req.body;
+    // Prevent overwriting identity/audit fields from the client.
+    const {
+      _id,
+      createdAt,
+      createdBy,
+      createdByEmail,
+      creatorEmail,
+      ...updateFields
+    } = req.body;
 
     const cleanUpdate = {
       ...updateFields,
@@ -512,10 +625,6 @@ app.patch("/services/:id", requireAdmin, async (req, res) => {
     if (cleanUpdate.isActive !== undefined) {
       cleanUpdate.isActive = Boolean(cleanUpdate.isActive);
       cleanUpdate.status = cleanUpdate.isActive ? "active" : "inactive";
-    }
-
-    if (typeof cleanUpdate.createdBy === "string") {
-      cleanUpdate.createdBy = cleanUpdate.createdBy.trim().toLowerCase();
     }
 
     const result = await servicesCollection.updateOne(
@@ -685,18 +794,18 @@ app.get("/appointments", async (req, res) => {
       });
     }
 
-    const role = String(user.role || "customer").trim().toLowerCase();
+    const isAdmin = normalizeRole(user.role) === "admin";
     const query = {};
 
-    if (role === "admin") {
+    if (isAdmin) {
       // Admins may optionally filter by a customer email.
       if (email) {
-        query.customerEmail = String(email).trim().toLowerCase();
+        query.customerEmail = normalizeEmail(email);
       }
     } else {
-      // Customers can only view their own appointments. The email query value
-      // is deliberately ignored so one customer cannot read another's data.
-      query.customerEmail = String(user.email || "").trim().toLowerCase();
+      // Customers are scoped by their authenticated user id/email. Any email
+      // query string sent by the browser is deliberately ignored.
+      Object.assign(query, buildCustomerOwnershipFilter(user));
     }
 
     if (status && status !== "all") {
@@ -789,27 +898,20 @@ app.get("/appointments/:id", async (req, res) => {
       });
     }
 
-    const appointment = await appointmentsCollection.findOne({
-      _id: new ObjectId(id),
-    });
+    // Ownership is part of the database query itself, so a customer cannot
+    // fetch another customer's record by changing the URL.
+    const query = { _id: new ObjectId(id) };
+
+    if (normalizeRole(user.role) !== "admin") {
+      Object.assign(query, buildCustomerOwnershipFilter(user));
+    }
+
+    const appointment = await appointmentsCollection.findOne(query);
 
     if (!appointment) {
       return res.status(404).json({
         success: false,
         message: "Appointment not found.",
-      });
-    }
-
-    const role = String(user.role || "customer").trim().toLowerCase();
-    const isOwner =
-      String(user.email || "").trim().toLowerCase() ===
-      String(appointment.customerEmail || "").trim().toLowerCase();
-
-    // Customers may only read their own appointment; admins may read any.
-    if (role !== "admin" && !isOwner) {
-      return res.status(403).json({
-        success: false,
-        message: "You can only view your own appointments.",
       });
     }
 
@@ -852,7 +954,7 @@ app.get("/appointments/:id", async (req, res) => {
 app.patch("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, paymentStatus, stripeSessionId, amount, currency } = req.body;
+    const { status, paymentStatus, stripeSessionId, currency } = req.body;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -891,7 +993,7 @@ app.patch("/appointments/:id", async (req, res) => {
       const internalSecret = String(req.headers["x-internal-secret"] || "");
       const expectedSecret = String(process.env.BETTER_AUTH_SECRET || "");
 
-      if (!expectedSecret || internalSecret !== expectedSecret) {
+      if (!matchesInternalSecret(internalSecret, expectedSecret)) {
         return res.status(403).json({
           success: false,
           message:
@@ -908,7 +1010,9 @@ app.patch("/appointments/:id", async (req, res) => {
       }
 
       const cleanSessionId = String(stripeSessionId || "").trim();
-      const paymentAmount = Number(amount ?? existing.servicePrice ?? 0);
+      // The amount is always taken from the stored service price. Browser or
+      // webhook-supplied amounts are never used to adjust the payment record.
+      const paymentAmount = Number(existing.servicePrice || 0);
 
       if (normalizedPayment === "paid") {
         if (!cleanSessionId) {
@@ -1004,11 +1108,8 @@ app.patch("/appointments/:id", async (req, res) => {
       });
     }
 
-    const isAdmin =
-      String(authenticatedUser.role || "").trim().toLowerCase() === "admin";
-    const isOwner =
-      String(authenticatedUser.email || "").trim().toLowerCase() ===
-      String(existing.customerEmail || "").trim().toLowerCase();
+    const isAdmin = normalizeRole(authenticatedUser.role) === "admin";
+    const isOwner = isAppointmentOwner(authenticatedUser, existing);
 
     // Only pending appointments can be confirmed, and only by an admin.
     if (nextStatus === "confirmed") {
@@ -1066,22 +1167,51 @@ app.patch("/appointments/:id", async (req, res) => {
 });
 
 
-// GET all payment transactions for Admin Dashboard
-app.get("/transactions", requireAdmin, async (req, res) => {
+// Admins see the full ledger; customers only ever see their own payments.
+app.get("/transactions", async (req, res) => {
   try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to view transactions.",
+      });
+    }
+
+    if (Boolean(user.isBlocked)) {
+      return res.status(403).json({
+        success: false,
+        message: "This account is blocked.",
+      });
+    }
+
+    const role = normalizeRole(user.role);
+    const query = {};
+
+    if (role === "admin") {
+      // Admin dashboard requires the complete transaction list.
+    } else if (role === "customer") {
+      Object.assign(query, buildCustomerOwnershipFilter(user));
+    } else {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot view transactions.",
+      });
+    }
+
     const transactions = await transactionsCollection
-      .find({})
+      .find(query)
       .sort({ createdAt: -1 })
       .toArray();
 
-    // Attach the customer's profile image for the admin ledger.
     const enrichedTransactions = await Promise.all(
       transactions.map(async (item) => {
         let customerImage = item.customerImage || "";
 
         if (!customerImage && item.customerEmail) {
           const customer = await usersCollection.findOne({
-            email: String(item.customerEmail).trim().toLowerCase(),
+            email: normalizeEmail(item.customerEmail),
           });
           customerImage = customer?.image || "";
         }
@@ -1109,7 +1239,11 @@ app.get("/transactions", requireAdmin, async (req, res) => {
 app.get("/users", requireAdmin, async (req, res) => {
   try {
     const { search, status } = req.query;
-    const query = { role: { $ne: "admin" } };
+
+    // Case-insensitive exclusion keeps other admins out of the customer list.
+    const query = {
+      $and: [{ role: { $not: { $regex: /^admin$/i } } }],
+    };
 
     if (status === "blocked") {
       query.isBlocked = true;
@@ -1121,10 +1255,12 @@ app.get("/users", requireAdmin, async (req, res) => {
       const safeSearch = escapeRegex(String(search).trim().slice(0, 100));
 
       if (safeSearch) {
-        query.$or = [
-          { name: { $regex: safeSearch, $options: "i" } },
-          { email: { $regex: safeSearch, $options: "i" } },
-        ];
+        query.$and.push({
+          $or: [
+            { name: { $regex: safeSearch, $options: "i" } },
+            { email: { $regex: safeSearch, $options: "i" } },
+          ],
+        });
       }
     }
 
