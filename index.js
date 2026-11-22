@@ -125,7 +125,7 @@ function toCustomerResponse(user) {
 
 // services related api 
 // Create a new service using  creator email
-app.post("/services", async (req, res) => {
+app.post("/services", requireAdmin, async (req, res) => {
   try {
     const serviceData = req.body;
     const serviceName = String(
@@ -140,10 +140,29 @@ app.post("/services", async (req, res) => {
       });
     }
 
+    // The assignment requires a positive price and duration.
+    const priceValue = Number(serviceData.price);
+    const durationValue = Number(serviceData.duration);
+
+    if (!Number.isFinite(priceValue) || priceValue <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Price must be a positive number.",
+      });
+    }
+
+    if (!Number.isFinite(durationValue) || durationValue <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Duration must be a positive number of minutes.",
+      });
+    }
+
     const newService = {
       ...serviceData,
       serviceName,
-      price: Number(serviceData.price) || 0,
+      price: priceValue,
+      duration: durationValue,
       isActive:
         typeof serviceData.isActive === "boolean"
           ? serviceData.isActive
@@ -174,8 +193,25 @@ app.post("/services", async (req, res) => {
 app.get('/services', async (req, res) => {
   try {
     // Get query parameters from the client
-    const { category, search, limit } = req.query;
-    let query = { isActive: true };
+    const { category, search, limit, includeInactive } = req.query;
+
+    // Admin screens may ask for inactive services too, so they can be
+    // reactivated later. Everyone else only sees active services.
+    const wantsInactive = String(includeInactive).toLowerCase() === "true";
+
+    if (wantsInactive) {
+      const user = await getAuthenticatedUser(req);
+      const role = String(user?.role || "").trim().toLowerCase();
+
+      if (role !== "admin") {
+        return res.status(403).json({
+          success: false,
+          message: "Admin access required.",
+        });
+      }
+    }
+
+    let query = wantsInactive ? {} : { isActive: true };
 
     // Filter services by category if a category is provided
     // Skip category filtering when the category is "All"
@@ -251,7 +287,7 @@ app.get("/services/:id", async (req, res) => {
 });
 
 // Delete a salon service by ID
-app.delete("/services/:id", async (req, res) => {
+app.delete("/services/:id", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -287,7 +323,7 @@ app.delete("/services/:id", async (req, res) => {
 });
 
 // Update an existing salon service by ID
-app.patch("/services/:id", async (req, res) => {
+app.patch("/services/:id", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -318,7 +354,35 @@ app.patch("/services/:id", async (req, res) => {
     }
 
     if (cleanUpdate.price !== undefined) {
-      cleanUpdate.price = Number(cleanUpdate.price) || 0;
+      const priceValue = Number(cleanUpdate.price);
+
+      if (!Number.isFinite(priceValue) || priceValue <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Price must be a positive number.",
+        });
+      }
+
+      cleanUpdate.price = priceValue;
+    }
+
+    if (cleanUpdate.duration !== undefined) {
+      const durationValue = Number(cleanUpdate.duration);
+
+      if (!Number.isFinite(durationValue) || durationValue <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Duration must be a positive number of minutes.",
+        });
+      }
+
+      cleanUpdate.duration = durationValue;
+    }
+
+    // Keep the active flag and the legacy status field in sync.
+    if (cleanUpdate.isActive !== undefined) {
+      cleanUpdate.isActive = Boolean(cleanUpdate.isActive);
+      cleanUpdate.status = cleanUpdate.isActive ? "active" : "inactive";
     }
 
     if (typeof cleanUpdate.createdBy === "string") {
@@ -496,10 +560,21 @@ app.get("/appointments", async (req, res) => {
           }
         }
 
+        // Attach the customer's profile image from the Better Auth user
+        let customerImage = item.customerImage || "";
+
+        if (!customerImage && item.customerEmail) {
+          const customer = await usersCollection.findOne({
+            email: String(item.customerEmail).trim().toLowerCase(),
+          });
+          customerImage = customer?.image || "";
+        }
+
         return {
           ...item,
           serviceImage,
           serviceCategory,
+          customerImage,
         };
       })
     );
@@ -618,18 +693,34 @@ app.patch("/appointments/:id", async (req, res) => {
 
     const currentStatus = String(existing.status || "pending").toLowerCase();
 
-    if (nextStatus === "cancelled" && currentStatus !== "pending") {
+    // Admins can cancel pending or confirmed bookings. Customers can only
+    // cancel their own pending requests.
+    const authenticatedUser = await getAuthenticatedUser(req);
+    const isAdmin =
+      String(authenticatedUser?.role || "").trim().toLowerCase() === "admin";
+
+    // Only pending appointments can be confirmed.
+    if (nextStatus === "confirmed" && currentStatus !== "pending") {
       return res.status(400).json({
         success: false,
-        message: `Cannot cancel an already ${currentStatus} appointment.`,
+        message: "Only pending appointments can be confirmed.",
       });
     }
 
-    if (nextStatus === "confirmed" && currentStatus === "cancelled") {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot confirm a cancelled appointment.",
-      });
+    if (nextStatus === "cancelled") {
+      const canCancel =
+        currentStatus === "pending" ||
+        (currentStatus === "confirmed" && isAdmin);
+
+      if (!canCancel) {
+        return res.status(400).json({
+          success: false,
+          message:
+            currentStatus === "confirmed"
+              ? "Only an admin can cancel a confirmed appointment."
+              : `Cannot cancel an already ${currentStatus} appointment.`,
+        });
+      }
     }
 
     await appointmentsCollection.updateOne(
@@ -657,16 +748,32 @@ app.patch("/appointments/:id", async (req, res) => {
 
 
 // GET all payment transactions for Admin Dashboard
-app.get("/transactions", async (req, res) => {
+app.get("/transactions", requireAdmin, async (req, res) => {
   try {
     const transactions = await transactionsCollection
       .find({})
       .sort({ createdAt: -1 })
       .toArray();
 
+    // Attach the customer's profile image for the admin ledger.
+    const enrichedTransactions = await Promise.all(
+      transactions.map(async (item) => {
+        let customerImage = item.customerImage || "";
+
+        if (!customerImage && item.customerEmail) {
+          const customer = await usersCollection.findOne({
+            email: String(item.customerEmail).trim().toLowerCase(),
+          });
+          customerImage = customer?.image || "";
+        }
+
+        return { ...item, customerImage };
+      })
+    );
+
     return res.status(200).json({
       success: true,
-      data: transactions,
+      data: enrichedTransactions,
     });
   } catch (error) {
     console.error("GET /transactions error:", error);
