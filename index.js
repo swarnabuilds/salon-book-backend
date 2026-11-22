@@ -8,7 +8,12 @@ import { ObjectId } from "mongodb";
 const app = express();
 const port = process.env.PORT ||  5000;
 
-app.use(cors())
+app.use(
+  cors({
+    origin: ["http://localhost:3000", process.env.CLIENT_URL].filter(Boolean),
+    credentials: true,
+  })
+);
 app.use(express.json())
 
 
@@ -26,6 +31,8 @@ const connectedClient = await connectToMongoDB();
 const db = connectedClient.db("salon-book-system");
 const servicesCollection = db.collection("services");
 const appointmentsCollection = db.collection("appointments");
+const transactionsCollection = db.collection("transactions");
+
 
 
 // services related api 
@@ -423,11 +430,10 @@ app.get("/appointments", async (req, res) => {
 });
 
 // Update appointment status (confirmed, completed, cancelled)
-// Update appointment status or payment status
 app.patch("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, paymentStatus, stripeSessionId } = req.body;
+    const { status, paymentStatus, stripeSessionId, amount, currency } = req.body;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -447,7 +453,19 @@ app.patch("/appointments/:id", async (req, res) => {
       });
     }
 
-    // Update payment status after Stripe payment completes
+    const currentPaymentStatus = String(
+      existing.paymentStatus || "unpaid"
+    ).toLowerCase();
+
+    // Prevent updating payment status if already paid
+    if (paymentStatus && currentPaymentStatus === "paid") {
+      return res.status(400).json({
+        success: false,
+        message: "This appointment is already paid.",
+      });
+    }
+
+    // Handle payment status update after successful Stripe checkout
     if (paymentStatus) {
       const normalizedPayment = String(paymentStatus).trim().toLowerCase();
       if (!["paid", "unpaid"].includes(normalizedPayment)) {
@@ -469,13 +487,37 @@ app.patch("/appointments/:id", async (req, res) => {
         }
       );
 
+      // Save transaction record in transactionsCollection when payment is paid
+      if (normalizedPayment === "paid") {
+        const existingTx = await transactionsCollection.findOne({
+          appointmentId: String(id),
+          status: "paid",
+        });
+
+        if (!existingTx) {
+          await transactionsCollection.insertOne({
+            appointmentId: String(id),
+            customerId: existing.customerId || existing.customerEmail || "",
+            customerName: existing.customerName || "Customer",
+            customerEmail: existing.customerEmail || "",
+            serviceName: existing.serviceName || "Salon Service",
+            appointmentDate: existing.appointmentDate || "",
+            amount: Number(amount ?? existing.servicePrice ?? 0),
+            currency: String(currency || "USD").toUpperCase(),
+            stripeSessionId: stripeSessionId || `session_${id}`,
+            status: "paid",
+            createdAt: new Date(),
+          });
+        }
+      }
+
       return res.status(200).json({
         success: true,
         message: `Payment marked as ${normalizedPayment}.`,
       });
     }
 
-    // Update booking status (confirmed, completed, cancelled)
+    // Handle booking status update (confirmed, completed, cancelled)
     const nextStatus = String(status || "").trim().toLowerCase();
     const allowedStatuses = ["confirmed", "completed", "cancelled"];
 
@@ -521,6 +563,28 @@ app.patch("/appointments/:id", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Server error while updating appointment.",
+    });
+  }
+});
+
+
+// GET all payment transactions for Admin Dashboard
+app.get("/transactions", async (req, res) => {
+  try {
+    const transactions = await transactionsCollection
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      data: transactions,
+    });
+  } catch (error) {
+    console.error("GET /transactions error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load transactions.",
     });
   }
 });
