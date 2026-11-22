@@ -1,15 +1,16 @@
 {
   "name": "salon-book-backend",
   "version": "1.0.0",
-  "description": "",
+  "description": "Express REST API for the SalonBook appointment booking platform",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "dev": "node --watch index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module",
   "dependencies": {
     "cors": "^2.8.6",
     "dotenv": "^18.0.10",

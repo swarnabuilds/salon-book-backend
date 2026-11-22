@@ -3,18 +3,79 @@ import cors from 'cors';
 import 'dotenv/config'
 import { MongoClient } from 'mongodb';
 import { ObjectId } from "mongodb";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 
 const app = express();
 const port = process.env.PORT ||  5000;
 
+// Only known client origins may call this API with cookies.
+const allowedOrigins = [
+  "http://localhost:3000",
+  process.env.CLIENT_URL,
+  process.env.BETTER_AUTH_URL,
+]
+  .flatMap((value) => String(value || "").split(","))
+  .map((value) => value.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: ["http://localhost:3000", process.env.CLIENT_URL].filter(Boolean),
+    origin: [...new Set(allowedOrigins)],
     credentials: true,
   })
 );
 app.use(express.json())
+
+// JWT verification middleware. The Next.js app signs a short-lived HS256
+// token with BETTER_AUTH_SECRET; this verifies it before session fallback.
+function verifyJwt(req, _res, next) {
+  req.jwtUser = null;
+
+  const authHeader = String(req.headers.authorization || "");
+  if (!authHeader.startsWith("Bearer ")) return next();
+
+  const token = authHeader.slice(7).trim();
+  const secret = String(process.env.BETTER_AUTH_SECRET || "");
+  const parts = token.split(".");
+  if (!secret || parts.length !== 3) return next();
+
+  const [encodedHeader, encodedPayload, signature] = parts;
+
+  try {
+    const header = JSON.parse(
+      Buffer.from(encodedHeader, "base64url").toString("utf8")
+    );
+    if (header.alg !== "HS256") return next();
+
+    const expected = createHmac("sha256", secret)
+      .update(`${encodedHeader}.${encodedPayload}`)
+      .digest();
+    const actual = Buffer.from(signature, "base64url");
+
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+      return next();
+    }
+
+    const payload = JSON.parse(
+      Buffer.from(encodedPayload, "base64url").toString("utf8")
+    );
+    if (!payload.exp || payload.exp * 1000 <= Date.now()) return next();
+
+    req.jwtUser = {
+      id: payload.sub || payload.id || "",
+      email: String(payload.email || "").trim().toLowerCase(),
+      role: String(payload.role || "customer"),
+      isBlocked: Boolean(payload.isBlocked),
+    };
+  } catch {
+    req.jwtUser = null;
+  }
+
+  return next();
+}
+
+app.use(verifyJwt);
 
 
 const client = new MongoClient(process.env.MONGO_URI)
@@ -42,6 +103,9 @@ const AUTH_URL = (
 ).replace(/\/$/, "");
 
 async function getAuthenticatedUser(req) {
+  // A verified JWT is preferred when the client sends one.
+  if (req.jwtUser) return req.jwtUser;
+
   const cookie = req.headers.cookie;
   if (!cookie) return null;
 
@@ -158,15 +222,18 @@ app.post("/services", requireAdmin, async (req, res) => {
       });
     }
 
+    const isActive =
+      typeof serviceData.isActive === "boolean"
+        ? serviceData.isActive
+        : serviceData.status !== "inactive";
+
     const newService = {
       ...serviceData,
       serviceName,
       price: priceValue,
       duration: durationValue,
-      isActive:
-        typeof serviceData.isActive === "boolean"
-          ? serviceData.isActive
-          : serviceData.status !== "inactive",
+      isActive,
+      status: isActive ? "active" : "inactive",
       createdBy: String(serviceData.createdBy).trim().toLowerCase(),
       createdAt: new Date(),
     };
@@ -201,8 +268,22 @@ app.get('/services', async (req, res) => {
 
     if (wantsInactive) {
       const user = await getAuthenticatedUser(req);
-      const role = String(user?.role || "").trim().toLowerCase();
 
+      if (!user) {
+        return res.status(401).json({
+          success: false,
+          message: "Please sign in to continue.",
+        });
+      }
+
+      if (Boolean(user.isBlocked)) {
+        return res.status(403).json({
+          success: false,
+          message: "This account is blocked.",
+        });
+      }
+
+      const role = String(user.role || "").trim().toLowerCase();
       if (role !== "admin") {
         return res.status(403).json({
           success: false,
@@ -211,7 +292,10 @@ app.get('/services', async (req, res) => {
       }
     }
 
-    let query = wantsInactive ? {} : { isActive: true };
+    // Legacy "inactive" status records must never appear on public pages.
+    let query = wantsInactive
+      ? {}
+      : { isActive: true, status: { $ne: "inactive" } };
 
     // Filter services by category if a category is provided
     // Skip category filtering when the category is "All"
@@ -221,10 +305,13 @@ app.get('/services', async (req, res) => {
 
     // Search services by serviceName if a search value is provided
     if (search) {
-      query.serviceName = {
-        $regex: search,
-        $options: 'i'
-      };
+      const safeSearch = escapeRegex(String(search).trim().slice(0, 100));
+      if (safeSearch) {
+        query.serviceName = {
+          $regex: safeSearch,
+          $options: 'i'
+        };
+      }
     }
 
     // Find services based on the query
@@ -271,6 +358,23 @@ app.get("/services/:id", async (req, res) => {
         success: false,
         message: "Service not found.",
       });
+    }
+
+    const isActive = service.isActive !== false && service.status !== "inactive";
+    if (!isActive) {
+      // Inactive services are only visible to a signed-in, unblocked admin.
+      const user = await getAuthenticatedUser(req);
+      const isAdmin =
+        user &&
+        !Boolean(user.isBlocked) &&
+        String(user.role || "").trim().toLowerCase() === "admin";
+
+      if (!isAdmin) {
+        return res.status(404).json({
+          success: false,
+          message: "Service not found.",
+        });
+      }
     }
 
     return res.status(200).json({
@@ -422,35 +526,44 @@ app.patch("/services/:id", requireAdmin, async (req, res) => {
 
 // appointments api
 // Create a new appointment booking
-// Create a new appointment booking (without authMiddleware for now)
 
 app.post("/appointments", async (req, res) => {
   try {
-    const {
-      serviceId,
-      appointmentDate,
-      timeSlot,
-      message,
-      customerId,
-      customerName,
-      customerEmail,
-      customerRole,
-    } = req.body;
+    const { serviceId, appointmentDate, timeSlot, message } = req.body;
 
-    // Validate required fields
-    if (!serviceId || !customerEmail || !appointmentDate || !timeSlot) {
-      return res.status(400).json({
+    // Only authenticated customers can book appointments. The role and the
+    // customer identity come from the verified session, never from the body.
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
         success: false,
-        message: "Required fields are missing.",
+        message: "Please sign in to book an appointment.",
       });
     }
 
-    // Allow only customers to book appointments
-    const normalizedRole = String(customerRole || "customer").trim().toLowerCase();
+    if (Boolean(user.isBlocked)) {
+      return res.status(403).json({
+        success: false,
+        message: "This account is blocked.",
+      });
+    }
+
+    const normalizedRole = String(user.role || "customer")
+      .trim()
+      .toLowerCase();
+
     if (normalizedRole !== "customer") {
       return res.status(403).json({
         success: false,
         message: "Only customers can book appointments.",
+      });
+    }
+
+    if (!serviceId || !appointmentDate || !timeSlot) {
+      return res.status(400).json({
+        success: false,
+        message: "Required fields are missing.",
       });
     }
 
@@ -493,9 +606,11 @@ app.post("/appointments", async (req, res) => {
     // Create the appointment
     const appointment = {
       serviceId,
-      customerId: customerId || "",
-      customerName: String(customerName || "").trim(),
-      customerEmail: String(customerEmail).trim().toLowerCase(),
+      customerId: String(user.id || user._id || ""),
+      customerName: String(user.name || "").trim(),
+      customerEmail: String(user.email || "")
+        .trim()
+        .toLowerCase(),
       serviceName: service.serviceName,
       appointmentDate: String(appointmentDate).trim(),
       timeSlot: String(timeSlot).trim(),
@@ -523,15 +638,42 @@ app.post("/appointments", async (req, res) => {
 });
 
 
-// Get appointments (filtered by customerEmail)
+// Get appointments. Customers only ever receive their own records; admins
+// receive every appointment.
 app.get("/appointments", async (req, res) => {
   try {
     const { email, status } = req.query;
+
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to view appointments.",
+      });
+    }
+
+    if (Boolean(user.isBlocked)) {
+      return res.status(403).json({
+        success: false,
+        message: "This account is blocked.",
+      });
+    }
+
+    const role = String(user.role || "customer").trim().toLowerCase();
     const query = {};
 
-    if (email) {
-      query.customerEmail = String(email).trim().toLowerCase();
+    if (role === "admin") {
+      // Admins may optionally filter by a customer email.
+      if (email) {
+        query.customerEmail = String(email).trim().toLowerCase();
+      }
+    } else {
+      // Customers can only view their own appointments, regardless of the
+      // email value sent by the client.
+      query.customerEmail = String(user.email || "").trim().toLowerCase();
     }
+
     if (status && status !== "all") {
       query.status = String(status).trim().toLowerCase();
     }
@@ -592,6 +734,95 @@ app.get("/appointments", async (req, res) => {
   }
 });
 
+// Get a single appointment. Used by the checkout flow to verify that the
+// appointment exists, belongs to the signed-in customer, is confirmed, and is
+// still unpaid before a Stripe session is created.
+app.get("/appointments/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid appointment ID.",
+      });
+    }
+
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to view this appointment.",
+      });
+    }
+
+    if (Boolean(user.isBlocked)) {
+      return res.status(403).json({
+        success: false,
+        message: "This account is blocked.",
+      });
+    }
+
+    const appointment = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!appointment) {
+      return res.status(404).json({
+        success: false,
+        message: "Appointment not found.",
+      });
+    }
+
+    const role = String(user.role || "customer").trim().toLowerCase();
+    const isOwner =
+      String(user.email || "").trim().toLowerCase() ===
+      String(appointment.customerEmail || "").trim().toLowerCase();
+
+    // Customers may only read their own appointment; admins may read any.
+    if (role !== "admin" && !isOwner) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only view your own appointments.",
+      });
+    }
+
+    let serviceImage = appointment.serviceImage || appointment.image || "";
+    let serviceCategory =
+      appointment.serviceCategory || appointment.category || "";
+
+    if (
+      (!serviceImage || !serviceCategory) &&
+      appointment.serviceId &&
+      ObjectId.isValid(appointment.serviceId)
+    ) {
+      const srv = await servicesCollection.findOne({
+        _id: new ObjectId(appointment.serviceId),
+      });
+      if (srv) {
+        serviceImage = serviceImage || srv.image || "";
+        serviceCategory = serviceCategory || srv.category || "";
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        ...appointment,
+        serviceImage,
+        serviceCategory,
+      },
+    });
+  } catch (error) {
+    console.error("Fetch single appointment error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch the appointment.",
+    });
+  }
+});
+
 // Update appointment status (confirmed, completed, cancelled)
 app.patch("/appointments/:id", async (req, res) => {
   try {
@@ -630,6 +861,19 @@ app.patch("/appointments/:id", async (req, res) => {
 
     // Handle payment status update after successful Stripe checkout
     if (paymentStatus) {
+      // Only the verified server-side Stripe success flow may mark a payment
+      // as paid. A browser request cannot fake a successful payment.
+      const internalSecret = String(req.headers["x-internal-secret"] || "");
+      const expectedSecret = String(process.env.BETTER_AUTH_SECRET || "");
+
+      if (!expectedSecret || internalSecret !== expectedSecret) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Payment status can only be updated after a verified Stripe payment.",
+        });
+      }
+
       const normalizedPayment = String(paymentStatus).trim().toLowerCase();
       if (!["paid", "unpaid"].includes(normalizedPayment)) {
         return res.status(400).json({
@@ -638,13 +882,39 @@ app.patch("/appointments/:id", async (req, res) => {
         });
       }
 
+      const cleanSessionId = String(stripeSessionId || "").trim();
+      const paymentAmount = Number(amount ?? existing.servicePrice ?? 0);
+
+      if (normalizedPayment === "paid") {
+        if (!cleanSessionId) {
+          return res.status(400).json({
+            success: false,
+            message: "A Stripe checkout session ID is required.",
+          });
+        }
+
+        if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+          return res.status(400).json({
+            success: false,
+            message: "A positive payment amount is required.",
+          });
+        }
+
+        if (String(existing.status || "").trim().toLowerCase() !== "confirmed") {
+          return res.status(400).json({
+            success: false,
+            message: "Only confirmed appointments can be paid.",
+          });
+        }
+      }
+
       await appointmentsCollection.updateOne(
         { _id: new ObjectId(id) },
         {
           $set: {
             paymentStatus: normalizedPayment,
-            ...(stripeSessionId ? { stripeSessionId } : {}),
-            paidAt: new Date(),
+            ...(cleanSessionId ? { stripeSessionId: cleanSessionId } : {}),
+            ...(normalizedPayment === "paid" ? { paidAt: new Date() } : {}),
             updatedAt: new Date(),
           },
         }
@@ -665,9 +935,9 @@ app.patch("/appointments/:id", async (req, res) => {
             customerEmail: existing.customerEmail || "",
             serviceName: existing.serviceName || "Salon Service",
             appointmentDate: existing.appointmentDate || "",
-            amount: Number(amount ?? existing.servicePrice ?? 0),
+            amount: paymentAmount,
             currency: String(currency || "USD").toUpperCase(),
-            stripeSessionId: stripeSessionId || `session_${id}`,
+            stripeSessionId: cleanSessionId,
             status: "paid",
             createdAt: new Date(),
           });
@@ -680,9 +950,9 @@ app.patch("/appointments/:id", async (req, res) => {
       });
     }
 
-    // Handle booking status update (confirmed, completed, cancelled)
+    // Handle booking status update (confirmed or cancelled only)
     const nextStatus = String(status || "").trim().toLowerCase();
-    const allowedStatuses = ["confirmed", "completed", "cancelled"];
+    const allowedStatuses = ["confirmed", "cancelled"];
 
     if (!allowedStatuses.includes(nextStatus)) {
       return res.status(400).json({
@@ -693,32 +963,56 @@ app.patch("/appointments/:id", async (req, res) => {
 
     const currentStatus = String(existing.status || "pending").toLowerCase();
 
-    // Admins can cancel pending or confirmed bookings. Customers can only
-    // cancel their own pending requests.
     const authenticatedUser = await getAuthenticatedUser(req);
-    const isAdmin =
-      String(authenticatedUser?.role || "").trim().toLowerCase() === "admin";
 
-    // Only pending appointments can be confirmed.
-    if (nextStatus === "confirmed" && currentStatus !== "pending") {
-      return res.status(400).json({
+    if (!authenticatedUser) {
+      return res.status(401).json({
         success: false,
-        message: "Only pending appointments can be confirmed.",
+        message: "Please sign in to update this appointment.",
       });
     }
 
+    if (Boolean(authenticatedUser.isBlocked)) {
+      return res.status(403).json({
+        success: false,
+        message: "This account is blocked.",
+      });
+    }
+
+    const isAdmin =
+      String(authenticatedUser.role || "").trim().toLowerCase() === "admin";
+    const isOwner =
+      String(authenticatedUser.email || "").trim().toLowerCase() ===
+      String(existing.customerEmail || "").trim().toLowerCase();
+
+    // Only pending appointments can be confirmed, and only by an admin.
+    if (nextStatus === "confirmed") {
+      if (!isAdmin) {
+        return res.status(403).json({
+          success: false,
+          message: "Only an admin can confirm appointments.",
+        });
+      }
+
+      if (currentStatus !== "pending") {
+        return res.status(400).json({
+          success: false,
+          message: "Only pending appointments can be confirmed.",
+        });
+      }
+    }
+
     if (nextStatus === "cancelled") {
-      const canCancel =
-        currentStatus === "pending" ||
-        (currentStatus === "confirmed" && isAdmin);
+      const canCancel = isAdmin
+        ? currentStatus === "pending" || currentStatus === "confirmed"
+        : isOwner && currentStatus === "pending";
 
       if (!canCancel) {
         return res.status(400).json({
           success: false,
-          message:
-            currentStatus === "confirmed"
-              ? "Only an admin can cancel a confirmed appointment."
-              : `Cannot cancel an already ${currentStatus} appointment.`,
+          message: isOwner
+            ? `Cannot cancel an already ${currentStatus} appointment.`
+            : "You can only cancel your own pending appointments.",
         });
       }
     }
