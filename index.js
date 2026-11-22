@@ -217,7 +217,8 @@ function buildUserIdFilter(id) {
 
 // Appointments store customerId as a string, but older records may use an
 // ObjectId or an email. Match all safe forms without trusting client input.
-function buildCustomerIdFilter(id) {
+// Shared matcher for id fields that may be stored as a string or ObjectId.
+function buildIdValueFilter(id) {
   const values = [String(id)];
 
   if (ObjectId.isValid(id)) {
@@ -225,6 +226,150 @@ function buildCustomerIdFilter(id) {
   }
 
   return { $in: values };
+}
+
+function buildCustomerIdFilter(id) {
+  return buildIdValueFilter(id);
+}
+
+// Services belong to the admin who created them. Older records may only have
+// createdBy, so both the id and email are checked.
+function buildAdminServiceFilter(admin) {
+  const clauses = [];
+  const adminId = String(admin?.id || admin?._id || "").trim();
+  const adminEmail = normalizeEmail(admin?.email);
+
+  if (adminId) {
+    clauses.push({ createdById: buildIdValueFilter(adminId) });
+  }
+
+  if (adminEmail) {
+    clauses.push({ createdBy: adminEmail });
+  }
+
+  return { $or: clauses.length ? clauses : [{ _id: "__no_admin__" }] };
+}
+
+function isServiceOwnedByAdmin(service, admin) {
+  const adminId = String(admin?.id || admin?._id || "").trim().toLowerCase();
+  const adminEmail = normalizeEmail(admin?.email);
+  const ownerId = String(service?.createdById || "")
+    .trim()
+    .toLowerCase();
+
+  if (adminId && ownerId && adminId === ownerId) return true;
+  if (adminEmail && normalizeEmail(service?.createdBy) === adminEmail) return true;
+
+  return false;
+}
+
+async function getOwnedServiceIds(admin) {
+  const ownedServices = await servicesCollection
+    .find(buildAdminServiceFilter(admin))
+    .project({ _id: 1 })
+    .toArray();
+
+  return ownedServices.map((service) => service._id);
+}
+
+// Appointments store the service owner at booking time. The serviceId fallback
+// keeps older records visible to the correct admin after this field is added.
+async function buildAdminAppointmentFilter(admin) {
+  const clauses = [];
+  const adminId = String(admin?.id || admin?._id || "").trim();
+  const adminEmail = normalizeEmail(admin?.email);
+  const ownedServiceIds = await getOwnedServiceIds(admin);
+
+  if (adminEmail) {
+    clauses.push({ adminEmail });
+    clauses.push({ serviceOwnerEmail: adminEmail });
+  }
+
+  if (adminId) {
+    clauses.push({ adminId: buildIdValueFilter(adminId) });
+    clauses.push({ serviceOwnerId: buildIdValueFilter(adminId) });
+  }
+
+  if (ownedServiceIds.length) {
+    // Appointments may store serviceId as a string or an ObjectId.
+    const serviceIdValues = ownedServiceIds.flatMap((id) => [id, String(id)]);
+    clauses.push({ serviceId: { $in: serviceIdValues } });
+  }
+
+  return { $or: clauses.length ? clauses : [{ _id: "__no_admin__" }] };
+}
+
+async function isAppointmentOwnedByAdmin(appointment, admin) {
+  const adminId = String(admin?.id || admin?._id || "").trim().toLowerCase();
+  const adminEmail = normalizeEmail(admin?.email);
+  const ownerEmail = normalizeEmail(
+    appointment?.adminEmail || appointment?.serviceOwnerEmail
+  );
+  const ownerId = String(appointment?.adminId || appointment?.serviceOwnerId || "")
+    .trim()
+    .toLowerCase();
+
+  if (adminEmail && ownerEmail && adminEmail === ownerEmail) return true;
+  if (adminId && ownerId && adminId === ownerId) return true;
+
+  // Legacy appointments may not have owner fields yet. Check the linked
+  // service instead so the correct admin still owns the record.
+  if (appointment?.serviceId && ObjectId.isValid(appointment.serviceId)) {
+    const service = await servicesCollection.findOne({
+      _id: new ObjectId(appointment.serviceId),
+    });
+
+    if (service && isServiceOwnedByAdmin(service, admin)) return true;
+  }
+
+  return false;
+}
+
+// Read the admin identity from the booked service. Used when creating
+// appointments and when recording a Stripe transaction.
+async function getServiceOwnerInfo(serviceId) {
+  if (!serviceId || !ObjectId.isValid(serviceId)) {
+    return { adminEmail: "", adminId: "" };
+  }
+
+  const service = await servicesCollection.findOne({
+    _id: new ObjectId(serviceId),
+  });
+
+  return {
+    adminEmail: normalizeEmail(service?.createdBy),
+    adminId: String(service?.createdById || ""),
+  };
+}
+
+async function buildAdminTransactionFilter(admin) {
+  const clauses = [];
+  const adminId = String(admin?.id || admin?._id || "").trim();
+  const adminEmail = normalizeEmail(admin?.email);
+  const ownedAppointments = await appointmentsCollection
+    .find(await buildAdminAppointmentFilter(admin))
+    .project({ _id: 1 })
+    .toArray();
+  const ownedAppointmentIds = ownedAppointments.flatMap((item) => [
+    item._id,
+    String(item._id),
+  ]);
+
+  if (adminEmail) {
+    clauses.push({ adminEmail });
+    clauses.push({ serviceOwnerEmail: adminEmail });
+  }
+
+  if (adminId) {
+    clauses.push({ adminId: buildIdValueFilter(adminId) });
+    clauses.push({ serviceOwnerId: buildIdValueFilter(adminId) });
+  }
+
+  if (ownedAppointmentIds.length) {
+    clauses.push({ appointmentId: { $in: ownedAppointmentIds } });
+  }
+
+  return { $or: clauses.length ? clauses : [{ _id: "__no_admin__" }] };
 }
 
 // Build the query used for every customer-owned collection. Email is kept as
@@ -351,6 +496,7 @@ app.post("/services", requireAdmin, async (req, res) => {
 
     const {
       createdBy,
+      createdById,
       createdByEmail,
       creatorEmail,
       _id,
@@ -364,7 +510,9 @@ app.post("/services", requireAdmin, async (req, res) => {
       duration: durationValue,
       isActive,
       status: isActive ? "active" : "inactive",
+      // Both owner fields come from the verified session, never the request.
       createdBy: adminEmail,
+      createdById: String(req.authenticatedUser.id || req.authenticatedUser._id || ""),
       createdAt: new Date(),
     };
 
@@ -390,13 +538,20 @@ app.post("/services", requireAdmin, async (req, res) => {
 app.get('/services', async (req, res) => {
   try {
     // Get query parameters from the client
-    const { category, search, limit, includeInactive } = req.query;
+    const { category, search, limit, includeInactive, scope } = req.query;
 
-    // Admin screens may ask for inactive services too, so they can be
-    // reactivated later. Everyone else only sees active services.
+    // Admin screens ask for inactive services and scope=admin. Both require a
+    // verified admin and return only that admin's own services.
     const wantsInactive = String(includeInactive).toLowerCase() === "true";
+    const wantsAdminScope =
+      wantsInactive || String(scope).trim().toLowerCase() === "admin";
 
-    if (wantsInactive) {
+    // Legacy "inactive" status records must never appear on public pages.
+    let query = wantsInactive
+      ? {}
+      : { isActive: true, status: { $ne: "inactive" } };
+
+    if (wantsAdminScope) {
       const user = await getAuthenticatedUser(req);
 
       if (!user) {
@@ -413,19 +568,15 @@ app.get('/services', async (req, res) => {
         });
       }
 
-      const role = String(user.role || "").trim().toLowerCase();
-      if (role !== "admin") {
+      if (normalizeRole(user.role) !== "admin") {
         return res.status(403).json({
           success: false,
           message: "Admin access required.",
         });
       }
-    }
 
-    // Legacy "inactive" status records must never appear on public pages.
-    let query = wantsInactive
-      ? {}
-      : { isActive: true, status: { $ne: "inactive" } };
+      Object.assign(query, buildAdminServiceFilter(user));
+    }
 
     // Filter services by category if a category is provided
     // Skip category filtering when the category is "All"
@@ -492,19 +643,21 @@ app.get("/services/:id", async (req, res) => {
       });
     }
 
-    const user = await getAuthenticatedUser(req);
-    const isAdmin =
-      user &&
-      !Boolean(user.isBlocked) &&
-      String(user.role || "").trim().toLowerCase() === "admin";
     const isActive = service.isActive !== false && service.status !== "inactive";
 
-    // Inactive services are only visible to a signed-in, unblocked admin.
-    if (!isActive && !isAdmin) {
-      return res.status(404).json({
-        success: false,
-        message: "Service not found.",
-      });
+    // Active services stay public. Inactive services are admin-only and only
+    // the admin who created the service may open them.
+    if (!isActive) {
+      const user = await getAuthenticatedUser(req);
+      const isAdmin =
+        user && !Boolean(user.isBlocked) && normalizeRole(user.role) === "admin";
+
+      if (!isAdmin || !isServiceOwnedByAdmin(service, user)) {
+        return res.status(404).json({
+          success: false,
+          message: "Service not found.",
+        });
+      }
     }
 
     return res.status(200).json({
@@ -531,6 +684,22 @@ app.delete("/services/:id", requireAdmin, async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Invalid service ID format.",
+      });
+    }
+
+    const service = await servicesCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found.",
+      });
+    }
+
+    if (!isServiceOwnedByAdmin(service, req.authenticatedUser)) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only manage services you created.",
       });
     }
 
@@ -570,11 +739,28 @@ app.patch("/services/:id", requireAdmin, async (req, res) => {
       });
     }
 
+    const service = await servicesCollection.findOne({ _id: new ObjectId(id) });
+
+    if (!service) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found.",
+      });
+    }
+
+    if (!isServiceOwnedByAdmin(service, req.authenticatedUser)) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only manage services you created.",
+      });
+    }
+
     // Prevent overwriting identity/audit fields from the client.
     const {
       _id,
       createdAt,
       createdBy,
+      createdById,
       createdByEmail,
       creatorEmail,
       ...updateFields
@@ -737,6 +923,9 @@ app.post("/appointments", async (req, res) => {
       });
     }
 
+    // Store the service owner so only that admin can manage this booking.
+    const serviceOwner = await getServiceOwnerInfo(serviceId);
+
     // Create the appointment
     const appointment = {
       serviceId,
@@ -745,6 +934,8 @@ app.post("/appointments", async (req, res) => {
       customerEmail: String(user.email || "")
         .trim()
         .toLowerCase(),
+      adminEmail: serviceOwner.adminEmail,
+      adminId: serviceOwner.adminId,
       serviceName: service.serviceName,
       appointmentDate: String(appointmentDate).trim(),
       timeSlot: String(timeSlot).trim(),
@@ -794,18 +985,26 @@ app.get("/appointments", async (req, res) => {
       });
     }
 
-    const isAdmin = normalizeRole(user.role) === "admin";
+    const role = normalizeRole(user.role);
     const query = {};
 
-    if (isAdmin) {
-      // Admins may optionally filter by a customer email.
+    if (role === "admin") {
+      // Admins only see bookings for their own services. They may still
+      // optionally filter those bookings by a customer email.
+      Object.assign(query, await buildAdminAppointmentFilter(user));
+
       if (email) {
         query.customerEmail = normalizeEmail(email);
       }
-    } else {
+    } else if (role === "customer") {
       // Customers are scoped by their authenticated user id/email. Any email
       // query string sent by the browser is deliberately ignored.
       Object.assign(query, buildCustomerOwnershipFilter(user));
+    } else {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot view appointments.",
+      });
     }
 
     if (status && status !== "all") {
@@ -898,12 +1097,21 @@ app.get("/appointments/:id", async (req, res) => {
       });
     }
 
-    // Ownership is part of the database query itself, so a customer cannot
-    // fetch another customer's record by changing the URL.
+    // Ownership is part of the database query itself. A customer cannot fetch
+    // another customer's record, and an admin cannot fetch another admin's
+    // booking by changing the URL.
     const query = { _id: new ObjectId(id) };
+    const role = normalizeRole(user.role);
 
-    if (normalizeRole(user.role) !== "admin") {
+    if (role === "customer") {
       Object.assign(query, buildCustomerOwnershipFilter(user));
+    } else if (role === "admin") {
+      Object.assign(query, await buildAdminAppointmentFilter(user));
+    } else {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot view this appointment.",
+      });
     }
 
     const appointment = await appointmentsCollection.findOne(query);
@@ -950,11 +1158,123 @@ app.get("/appointments/:id", async (req, res) => {
   }
 });
 
-// Update appointment status (confirmed, completed, cancelled)
+// Update a booking status. Admins may only change appointments tied to their
+// own services; customers may only cancel their own pending bookings.
+async function updateAppointmentStatusRecord(req, res, existing) {
+  try {
+    const nextStatus = String(req.body?.status || "").trim().toLowerCase();
+    const allowedStatuses = ["confirmed", "cancelled"];
+
+    if (!allowedStatuses.includes(nextStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: "Unsupported update operation.",
+      });
+    }
+
+    const currentStatus = String(existing.status || "pending").toLowerCase();
+    const authenticatedUser = await getAuthenticatedUser(req);
+
+    if (!authenticatedUser) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to update this appointment.",
+      });
+    }
+
+    if (Boolean(authenticatedUser.isBlocked)) {
+      return res.status(403).json({
+        success: false,
+        message: "This account is blocked.",
+      });
+    }
+
+    const role = normalizeRole(authenticatedUser.role);
+    const isAdmin = role === "admin";
+    const isCustomer = role === "customer";
+    const isOwner = isAppointmentOwner(authenticatedUser, existing);
+    const adminOwnsAppointment =
+      isAdmin && (await isAppointmentOwnedByAdmin(existing, authenticatedUser));
+
+    if (!isAdmin && !isCustomer) {
+      return res.status(403).json({
+        success: false,
+        message: "You cannot update appointments.",
+      });
+    }
+
+    if (isAdmin && !adminOwnsAppointment) {
+      return res.status(403).json({
+        success: false,
+        message: "You can only manage appointments for your own services.",
+      });
+    }
+
+    if (nextStatus === "confirmed") {
+      if (!isAdmin) {
+        return res.status(403).json({
+          success: false,
+          message: "Only an admin can confirm appointments.",
+        });
+      }
+
+      if (currentStatus !== "pending") {
+        return res.status(400).json({
+          success: false,
+          message: "Only pending appointments can be confirmed.",
+        });
+      }
+    }
+
+    if (nextStatus === "cancelled") {
+      if (!isAdmin && !isOwner) {
+        return res.status(403).json({
+          success: false,
+          message: "You can only cancel your own appointments.",
+        });
+      }
+
+      const allowedCurrentStatuses = isAdmin
+        ? ["pending", "confirmed"]
+        : ["pending"];
+
+      if (!allowedCurrentStatuses.includes(currentStatus)) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot cancel an already ${currentStatus} appointment.`,
+        });
+      }
+    }
+
+    await appointmentsCollection.updateOne(
+      { _id: new ObjectId(existing._id) },
+      {
+        $set: {
+          status: nextStatus,
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: `Appointment ${nextStatus} successfully.`,
+    });
+  } catch (error) {
+    console.error("PATCH appointment status error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while updating appointment status.",
+    });
+  }
+}
+
+// Update payment state or booking status. Payment updates are server-only;
+// status updates are checked for admin/customer ownership.
 app.patch("/appointments/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { status, paymentStatus, stripeSessionId, currency } = req.body;
+    const { paymentStatus, stripeSessionId, currency } = req.body || {};
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -974,171 +1294,66 @@ app.patch("/appointments/:id", async (req, res) => {
       });
     }
 
+    // No paymentStatus means this is a normal booking status update.
+    if (!paymentStatus) {
+      return updateAppointmentStatusRecord(req, res, existing);
+    }
+
     const currentPaymentStatus = String(
       existing.paymentStatus || "unpaid"
     ).toLowerCase();
 
-    // Prevent updating payment status if already paid
-    if (paymentStatus && currentPaymentStatus === "paid") {
+    if (currentPaymentStatus === "paid") {
       return res.status(400).json({
         success: false,
         message: "This appointment is already paid.",
       });
     }
 
-    // Handle payment status update after successful Stripe checkout
-    if (paymentStatus) {
-      // Only the verified server-side Stripe success flow may mark a payment
-      // as paid. A browser request cannot fake a successful payment.
-      const internalSecret = String(req.headers["x-internal-secret"] || "");
-      const expectedSecret = String(process.env.BETTER_AUTH_SECRET || "");
+    // Only the verified server-side Stripe success flow may mark a payment
+    // as paid. A browser request cannot fake a successful payment.
+    const internalSecret = String(req.headers["x-internal-secret"] || "");
+    const expectedSecret = String(process.env.BETTER_AUTH_SECRET || "");
 
-      if (!matchesInternalSecret(internalSecret, expectedSecret)) {
-        return res.status(403).json({
-          success: false,
-          message:
-            "Payment status can only be updated after a verified Stripe payment.",
-        });
-      }
-
-      const normalizedPayment = String(paymentStatus).trim().toLowerCase();
-      if (!["paid", "unpaid"].includes(normalizedPayment)) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid payment status.",
-        });
-      }
-
-      const cleanSessionId = String(stripeSessionId || "").trim();
-      // The amount is always taken from the stored service price. Browser or
-      // webhook-supplied amounts are never used to adjust the payment record.
-      const paymentAmount = Number(existing.servicePrice || 0);
-
-      if (normalizedPayment === "paid") {
-        if (!cleanSessionId) {
-          return res.status(400).json({
-            success: false,
-            message: "A Stripe checkout session ID is required.",
-          });
-        }
-
-        if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
-          return res.status(400).json({
-            success: false,
-            message: "A positive payment amount is required.",
-          });
-        }
-
-        if (String(existing.status || "").trim().toLowerCase() !== "confirmed") {
-          return res.status(400).json({
-            success: false,
-            message: "Only confirmed appointments can be paid.",
-          });
-        }
-      }
-
-      await appointmentsCollection.updateOne(
-        { _id: new ObjectId(id) },
-        {
-          $set: {
-            paymentStatus: normalizedPayment,
-            ...(cleanSessionId ? { stripeSessionId: cleanSessionId } : {}),
-            ...(normalizedPayment === "paid" ? { paidAt: new Date() } : {}),
-            updatedAt: new Date(),
-          },
-        }
-      );
-
-      // Save transaction record in transactionsCollection when payment is paid
-      if (normalizedPayment === "paid") {
-        const existingTx = await transactionsCollection.findOne({
-          appointmentId: String(id),
-          status: "paid",
-        });
-
-        if (!existingTx) {
-          await transactionsCollection.insertOne({
-            appointmentId: String(id),
-            customerId: existing.customerId || existing.customerEmail || "",
-            customerName: existing.customerName || "Customer",
-            customerEmail: existing.customerEmail || "",
-            serviceName: existing.serviceName || "Salon Service",
-            appointmentDate: existing.appointmentDate || "",
-            amount: paymentAmount,
-            currency: String(currency || "USD").toUpperCase(),
-            stripeSessionId: cleanSessionId,
-            status: "paid",
-            createdAt: new Date(),
-          });
-        }
-      }
-
-      return res.status(200).json({
-        success: true,
-        message: `Payment marked as ${normalizedPayment}.`,
-      });
-    }
-
-    // Handle booking status update (confirmed or cancelled only)
-    const nextStatus = String(status || "").trim().toLowerCase();
-    const allowedStatuses = ["confirmed", "cancelled"];
-
-    if (!allowedStatuses.includes(nextStatus)) {
-      return res.status(400).json({
-        success: false,
-        message: "Unsupported update operation.",
-      });
-    }
-
-    const currentStatus = String(existing.status || "pending").toLowerCase();
-
-    const authenticatedUser = await getAuthenticatedUser(req);
-
-    if (!authenticatedUser) {
-      return res.status(401).json({
-        success: false,
-        message: "Please sign in to update this appointment.",
-      });
-    }
-
-    if (Boolean(authenticatedUser.isBlocked)) {
+    if (!matchesInternalSecret(internalSecret, expectedSecret)) {
       return res.status(403).json({
         success: false,
-        message: "This account is blocked.",
+        message:
+          "Payment status can only be updated after a verified Stripe payment.",
       });
     }
 
-    const isAdmin = normalizeRole(authenticatedUser.role) === "admin";
-    const isOwner = isAppointmentOwner(authenticatedUser, existing);
-
-    // Only pending appointments can be confirmed, and only by an admin.
-    if (nextStatus === "confirmed") {
-      if (!isAdmin) {
-        return res.status(403).json({
-          success: false,
-          message: "Only an admin can confirm appointments.",
-        });
-      }
-
-      if (currentStatus !== "pending") {
-        return res.status(400).json({
-          success: false,
-          message: "Only pending appointments can be confirmed.",
-        });
-      }
+    const normalizedPayment = String(paymentStatus).trim().toLowerCase();
+    if (!["paid", "unpaid"].includes(normalizedPayment)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid payment status.",
+      });
     }
 
-    if (nextStatus === "cancelled") {
-      const canCancel = isAdmin
-        ? currentStatus === "pending" || currentStatus === "confirmed"
-        : isOwner && currentStatus === "pending";
+    const cleanSessionId = String(stripeSessionId || "").trim();
+    // The amount always comes from the stored service price.
+    const paymentAmount = Number(existing.servicePrice || 0);
 
-      if (!canCancel) {
+    if (normalizedPayment === "paid") {
+      if (!cleanSessionId) {
         return res.status(400).json({
           success: false,
-          message: isOwner
-            ? `Cannot cancel an already ${currentStatus} appointment.`
-            : "You can only cancel your own pending appointments.",
+          message: "A Stripe checkout session ID is required.",
+        });
+      }
+
+      if (!Number.isFinite(paymentAmount) || paymentAmount <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "A positive payment amount is required.",
+        });
+      }
+
+      if (String(existing.status || "").trim().toLowerCase() !== "confirmed") {
+        return res.status(400).json({
+          success: false,
+          message: "Only confirmed appointments can be paid.",
         });
       }
     }
@@ -1147,21 +1362,85 @@ app.patch("/appointments/:id", async (req, res) => {
       { _id: new ObjectId(id) },
       {
         $set: {
-          status: nextStatus,
+          paymentStatus: normalizedPayment,
+          ...(cleanSessionId ? { stripeSessionId: cleanSessionId } : {}),
+          ...(normalizedPayment === "paid" ? { paidAt: new Date() } : {}),
           updatedAt: new Date(),
         },
       }
     );
 
+    if (normalizedPayment === "paid") {
+      const existingTx = await transactionsCollection.findOne({
+        appointmentId: String(id),
+        status: "paid",
+      });
+
+      if (!existingTx) {
+        // Fall back to the linked service for older appointments that were
+        // created before owner fields were stored.
+        const serviceOwner = await getServiceOwnerInfo(existing.serviceId);
+
+        await transactionsCollection.insertOne({
+          appointmentId: String(id),
+          customerId: existing.customerId || existing.customerEmail || "",
+          customerName: existing.customerName || "Customer",
+          customerEmail: existing.customerEmail || "",
+          adminEmail: existing.adminEmail || serviceOwner.adminEmail,
+          adminId: existing.adminId || serviceOwner.adminId,
+          serviceName: existing.serviceName || "Salon Service",
+          appointmentDate: existing.appointmentDate || "",
+          amount: paymentAmount,
+          currency: String(currency || "USD").toUpperCase(),
+          stripeSessionId: cleanSessionId,
+          status: "paid",
+          createdAt: new Date(),
+        });
+      }
+    }
+
     return res.status(200).json({
       success: true,
-      message: `Appointment ${nextStatus} successfully.`,
+      message: `Payment marked as ${normalizedPayment}.`,
     });
   } catch (error) {
     console.error("PATCH /appointments/:id error:", error);
     return res.status(500).json({
       success: false,
       message: "Server error while updating appointment.",
+    });
+  }
+});
+
+// Explicit status endpoint used by the admin appointment actions.
+app.patch("/appointments/:id/status", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid appointment ID.",
+      });
+    }
+
+    const existing = await appointmentsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!existing) {
+      return res.status(404).json({
+        success: false,
+        message: "Appointment not found.",
+      });
+    }
+
+    return updateAppointmentStatusRecord(req, res, existing);
+  } catch (error) {
+    console.error("PATCH /appointments/:id/status error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while updating appointment status.",
     });
   }
 });
@@ -1190,7 +1469,8 @@ app.get("/transactions", async (req, res) => {
     const query = {};
 
     if (role === "admin") {
-      // Admin dashboard requires the complete transaction list.
+      // Admins only see revenue from their own services.
+      Object.assign(query, await buildAdminTransactionFilter(user));
     } else if (role === "customer") {
       Object.assign(query, buildCustomerOwnershipFilter(user));
     } else {
@@ -1233,6 +1513,71 @@ app.get("/transactions", async (req, res) => {
   }
 });
 
+// Admin overview numbers are calculated from the signed-in admin's own
+// services, appointments, and transactions only.
+app.get("/admin/overview", requireAdmin, async (req, res) => {
+  try {
+    const admin = req.authenticatedUser;
+    const [services, appointments, transactions] = await Promise.all([
+      servicesCollection
+        .find(buildAdminServiceFilter(admin))
+        .sort({ createdAt: -1 })
+        .toArray(),
+      appointmentsCollection
+        .find(await buildAdminAppointmentFilter(admin))
+        .sort({ createdAt: -1 })
+        .toArray(),
+      transactionsCollection
+        .find(await buildAdminTransactionFilter(admin))
+        .sort({ createdAt: -1 })
+        .toArray(),
+    ]);
+
+    const paidTransactions = transactions.filter(
+      (item) => String(item.status || "").toLowerCase() === "paid"
+    );
+    const totalRevenue = paidTransactions.reduce(
+      (sum, item) => sum + Number(item.amount || 0),
+      0
+    );
+
+    const stats = {
+      totalServices: services.length,
+      activeServices: services.filter(
+        (item) => item.isActive !== false && item.status !== "inactive"
+      ).length,
+      totalAppointments: appointments.length,
+      pendingCount: appointments.filter(
+        (item) => String(item.status || "pending").toLowerCase() === "pending"
+      ).length,
+      confirmedCount: appointments.filter(
+        (item) => String(item.status || "").toLowerCase() === "confirmed"
+      ).length,
+      completedCount: appointments.filter(
+        (item) => String(item.status || "").toLowerCase() === "completed"
+      ).length,
+      paidCount: paidTransactions.length,
+      totalRevenue,
+      currency: paidTransactions[0]?.currency || "usd",
+    };
+
+    return res.status(200).json({
+      success: true,
+      data: {
+        stats,
+        services: services.map(toPublicService),
+        appointments,
+        transactions,
+      },
+    });
+  } catch (error) {
+    console.error("GET /admin/overview error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load admin overview.",
+    });
+  }
+});
 
 // Admin: list registered customers. Other admins are never returned, even
 // if a client tries to request the admin role explicitly.
