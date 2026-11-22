@@ -203,6 +203,12 @@ function toCustomerResponse(user) {
   };
 }
 
+// Public service payloads must not reveal the admin account that created them.
+function toPublicService(service) {
+  const { createdBy, createdByEmail, creatorEmail, ...safeService } = service;
+  return safeService;
+}
+
 
 
 // services related api 
@@ -260,10 +266,10 @@ app.post("/services", requireAdmin, async (req, res) => {
     return res.status(201).json({
       success: true,
       message: "Service created successfully.",
-      data: {
+      data: toPublicService({
         _id: result.insertedId,
         ...newService,
-      },
+      }),
     });
   } catch (error) {
     console.error("Error creating service:", error);
@@ -344,10 +350,12 @@ app.get('/services', async (req, res) => {
     }
 
     const services = await cursor.toArray();
+    const visibleServices = services.map(toPublicService);
+
     res.status(200).json({
       success: true,
-      count: services.length,
-      data: services,
+      count: visibleServices.length,
+      data: visibleServices,
     });
   } catch (error) {
     res.status(500).json({
@@ -378,26 +386,25 @@ app.get("/services/:id", async (req, res) => {
       });
     }
 
+    const user = await getAuthenticatedUser(req);
+    const isAdmin =
+      user &&
+      !Boolean(user.isBlocked) &&
+      String(user.role || "").trim().toLowerCase() === "admin";
     const isActive = service.isActive !== false && service.status !== "inactive";
-    if (!isActive) {
-      // Inactive services are only visible to a signed-in, unblocked admin.
-      const user = await getAuthenticatedUser(req);
-      const isAdmin =
-        user &&
-        !Boolean(user.isBlocked) &&
-        String(user.role || "").trim().toLowerCase() === "admin";
 
-      if (!isAdmin) {
-        return res.status(404).json({
-          success: false,
-          message: "Service not found.",
-        });
-      }
+    // Inactive services are only visible to a signed-in, unblocked admin.
+    if (!isActive && !isAdmin) {
+      return res.status(404).json({
+        success: false,
+        message: "Service not found.",
+      });
     }
 
     return res.status(200).json({
       success: true,
-      data: service,
+      // Admin account details stored on a service are never exposed.
+      data: toPublicService(service),
     });
   } catch (error) {
     console.error("Error fetching service by ID:", error);
@@ -530,7 +537,7 @@ app.patch("/services/:id", requireAdmin, async (req, res) => {
     return res.status(200).json({
       success: true,
       message: "Service updated successfully.",
-      data: updatedService,
+      data: updatedService ? toPublicService(updatedService) : null,
     });
   } catch (error) {
     console.error("Error updating service:", error);
@@ -687,8 +694,8 @@ app.get("/appointments", async (req, res) => {
         query.customerEmail = String(email).trim().toLowerCase();
       }
     } else {
-      // Customers can only view their own appointments, regardless of the
-      // email value sent by the client.
+      // Customers can only view their own appointments. The email query value
+      // is deliberately ignored so one customer cannot read another's data.
       query.customerEmail = String(user.email || "").trim().toLowerCase();
     }
 
@@ -1097,7 +1104,8 @@ app.get("/transactions", requireAdmin, async (req, res) => {
 });
 
 
-// Admin: list registered customers (admins are not returned here)
+// Admin: list registered customers. Other admins are never returned, even
+// if a client tries to request the admin role explicitly.
 app.get("/users", requireAdmin, async (req, res) => {
   try {
     const { search, status } = req.query;
