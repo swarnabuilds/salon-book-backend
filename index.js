@@ -103,8 +103,26 @@ const AUTH_URL = (
 ).replace(/\/$/, "");
 
 async function getAuthenticatedUser(req) {
-  // A verified JWT is preferred when the client sends one.
-  if (req.jwtUser) return req.jwtUser;
+  // A verified JWT is preferred when the client sends one. Re-read the user
+  // from MongoDB so a newly blocked account loses access immediately.
+  if (req.jwtUser) {
+    const freshUser = await usersCollection.findOne({
+      $or: [
+        buildUserIdFilter(req.jwtUser.id),
+        { email: req.jwtUser.email },
+      ],
+    });
+
+    if (freshUser) {
+      return {
+        ...req.jwtUser,
+        role: freshUser.role || req.jwtUser.role,
+        isBlocked: Boolean(freshUser.isBlocked),
+      };
+    }
+
+    return req.jwtUser;
+  }
 
   const cookie = req.headers.cookie;
   if (!cookie) return null;
