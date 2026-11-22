@@ -32,6 +32,94 @@ const db = connectedClient.db("salon-book-system");
 const servicesCollection = db.collection("services");
 const appointmentsCollection = db.collection("appointments");
 const transactionsCollection = db.collection("transactions");
+const usersCollection = db.collection("user");
+
+// Better Auth lives in the Next.js app. Ask it who owns the request cookie.
+const AUTH_URL = (
+  process.env.BETTER_AUTH_URL ||
+  process.env.CLIENT_URL ||
+  "http://localhost:3000"
+).replace(/\/$/, "");
+
+async function getAuthenticatedUser(req) {
+  const cookie = req.headers.cookie;
+  if (!cookie) return null;
+
+  const response = await fetch(`${AUTH_URL}/api/auth/get-session`, {
+    headers: { cookie },
+  });
+
+  if (!response.ok) return null;
+
+  const data = await response.json().catch(() => null);
+  return data?.user || null;
+}
+
+// Use this on every admin-only API route.
+async function requireAdmin(req, res, next) {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Please sign in to continue.",
+      });
+    }
+
+    const role = String(user.role || "customer").trim().toLowerCase();
+
+    if (role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin access required.",
+      });
+    }
+
+    if (Boolean(user.isBlocked)) {
+      return res.status(403).json({
+        success: false,
+        message: "This account is blocked.",
+      });
+    }
+
+    return next();
+  } catch (error) {
+    console.error("Admin session verification failed:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Could not verify your session.",
+    });
+  }
+}
+
+function buildUserIdFilter(id) {
+  const values = [id];
+
+  if (ObjectId.isValid(id)) {
+    values.unshift(new ObjectId(id));
+  }
+
+  return { _id: { $in: values } };
+}
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function toCustomerResponse(user) {
+  return {
+    _id: String(user._id),
+    name: user.name || "",
+    email: user.email || "",
+    image: user.image || "",
+    role: user.role || "customer",
+    isBlocked: Boolean(user.isBlocked),
+    emailVerified: Boolean(user.emailVerified),
+    createdAt: user.createdAt || null,
+    updatedAt: user.updatedAt || null,
+  };
+}
 
 
 
@@ -589,6 +677,110 @@ app.get("/transactions", async (req, res) => {
   }
 });
 
+
+// Admin: list registered customers (admins are not returned here)
+app.get("/users", requireAdmin, async (req, res) => {
+  try {
+    const { search, status } = req.query;
+    const query = { role: { $ne: "admin" } };
+
+    if (status === "blocked") {
+      query.isBlocked = true;
+    } else if (status === "active") {
+      query.isBlocked = { $ne: true };
+    }
+
+    if (search) {
+      const safeSearch = escapeRegex(String(search).trim().slice(0, 100));
+
+      if (safeSearch) {
+        query.$or = [
+          { name: { $regex: safeSearch, $options: "i" } },
+          { email: { $regex: safeSearch, $options: "i" } },
+        ];
+      }
+    }
+
+    const customers = await usersCollection
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.status(200).json({
+      success: true,
+      count: customers.length,
+      data: customers.map(toCustomerResponse),
+    });
+  } catch (error) {
+    console.error("GET /users error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load customers.",
+    });
+  }
+});
+
+// Admin: block or unblock a customer
+app.patch("/users/:id/block", requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isBlocked } = req.body;
+
+    if (typeof isBlocked !== "boolean") {
+      return res.status(400).json({
+        success: false,
+        message: "isBlocked must be true or false.",
+      });
+    }
+
+    if (!id) {
+      return res.status(400).json({
+        success: false,
+        message: "User ID is required.",
+      });
+    }
+
+    const userFilter = buildUserIdFilter(id);
+    const user = await usersCollection.findOne(userFilter);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "Customer not found.",
+      });
+    }
+
+    if (String(user.role || "customer").trim().toLowerCase() === "admin") {
+      return res.status(400).json({
+        success: false,
+        message: "Admin accounts cannot be blocked.",
+      });
+    }
+
+    await usersCollection.updateOne(userFilter, {
+      $set: {
+        isBlocked,
+        updatedAt: new Date(),
+      },
+    });
+
+    const updatedUser = await usersCollection.findOne(userFilter);
+
+    return res.status(200).json({
+      success: true,
+      message: isBlocked
+        ? "Customer blocked successfully."
+        : "Customer unblocked successfully.",
+      data: toCustomerResponse(updatedUser || { ...user, isBlocked }),
+    });
+  } catch (error) {
+    console.error("PATCH /users/:id/block error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update customer status.",
+    });
+  }
+});
 
 app.get('/', (req, res) => {
   res.send('Hello World!');
