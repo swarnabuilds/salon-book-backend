@@ -9,11 +9,20 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 const app = express();
 const port = process.env.PORT ||  5000;
 
-// Only known client origins may call this API with cookies.
+// Only known client origins may call this API with cookies. Local development
+// uses localhost; production should rely on the configured client URL.
+const isProduction = process.env.NODE_ENV === "production";
 const allowedOrigins = [
-  "http://localhost:3000",
   process.env.CLIENT_URL,
   process.env.BETTER_AUTH_URL,
+  ...(isProduction
+    ? []
+    : [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+      ]),
 ]
   .flatMap((value) => String(value || "").split(","))
   .map((value) => value.trim().replace(/\/$/, ""))
@@ -1697,3 +1706,5 @@ app.get('/', (req, res) => {
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
 });
+
+export default app
